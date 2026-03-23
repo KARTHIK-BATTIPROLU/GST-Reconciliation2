@@ -9,7 +9,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+# Production: Fail fast if env var is missing
+# Local Dev: Fallback for convenience, but log warning
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8001")
+if not os.getenv("BACKEND_URL"):
+    print("WARNING: BACKEND_URL not set, using default localhost.")
+
 TIMEOUT = 10  # seconds
 
 

@@ -52,18 +52,21 @@ async def list_taxpayers():
     return {"taxpayers": records}
 
 
+from backend.schemas.validation import GSTINQuery
+
 # ════════════════════════════════════════════
 # GET /dashboard/overview/{gstin}
 # ════════════════════════════════════════════
 
 @router.get("/overview/{gstin}")
 async def dashboard_overview(gstin: str):
-    """Comprehensive CFO dashboard data for a GSTIN (buyer perspective).
+    """Comprehensive CFO dashboard data for a GSTIN (buyer perspective)."""
+    # Validation
+    try:
+        GSTINQuery(gstin=gstin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    Returns:
-        taxpayer, itc_summary, purchase_register, gstr2b,
-        vendor_risk, payment_warnings
-    """
     db = get_mongo_db()
 
     # ── Taxpayer info ──

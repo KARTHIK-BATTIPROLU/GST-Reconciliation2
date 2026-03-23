@@ -11,8 +11,11 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from neo4j import GraphDatabase
 import certifi
 
-# Load .env from project root
-load_dotenv()
+from backend.utils.logger import get_logger
+from backend.config import get_settings
+
+logger = get_logger(__name__)
+settings = get_settings()
 
 # ────────────────────────────────────────────
 # Singleton holders
@@ -29,23 +32,21 @@ def get_mongo_client() -> AsyncIOMotorClient:
     """Return the singleton Motor client, creating it on first call."""
     global _mongo_client
     if _mongo_client is None:
-        uri = os.getenv("MONGO_URI")
-        if not uri:
-            raise RuntimeError("MONGO_URI is not set in environment variables.")
+        uri = settings.MONGO_URI
         _mongo_client = AsyncIOMotorClient(
             uri,
-            serverSelectionTimeoutMS=30000,  # 30 s
+            serverSelectionTimeoutMS=30000,
             connectTimeoutMS=30000,
-            socketTimeoutMS=60000,            # 60 s for large inserts
-            tlsCAFile=certifi.where(),        # fix SSL on some Python builds
+            socketTimeoutMS=60000,
+            tlsCAFile=certifi.where(),
         )
     return _mongo_client
 
 
 def get_mongo_db():
     """Return the default MongoDB database handle."""
-    db_name = os.getenv("MONGO_DB_NAME", "gst_reconciliation")
-    return get_mongo_client()[db_name]
+    return get_mongo_client()[settings.MONGO_DB_NAME]
+
 
 
 async def ping_mongo() -> bool:
@@ -54,7 +55,7 @@ async def ping_mongo() -> bool:
         result = await get_mongo_client().admin.command("ping")
         return result.get("ok") == 1.0
     except Exception as exc:
-        print(f"[ping_mongo] failed: {exc}")
+        logger.error(f"MongoDB ping failed: {exc}")
         return False
 
 
@@ -66,15 +67,14 @@ def get_neo4j_driver():
     """Return the singleton Neo4j driver, creating it on first call."""
     global _neo4j_driver
     if _neo4j_driver is None:
-        uri = os.getenv("NEO4J_URI")
-        user = os.getenv("NEO4J_USER")
-        password = os.getenv("NEO4J_PASSWORD")
-        if not all([uri, user, password]):
-            raise RuntimeError("NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD not fully set.")
+        uri = settings.NEO4J_URI
+        user = settings.NEO4J_USER
+        password = settings.NEO4J_PASSWORD
+        
         _neo4j_driver = GraphDatabase.driver(
             uri,
             auth=(user, password),
-            connection_timeout=10,       # seconds to establish TCP
+            connection_timeout=10,
             connection_acquisition_timeout=10,
         )
     return _neo4j_driver
@@ -87,8 +87,9 @@ def ping_neo4j() -> bool:
         driver.verify_connectivity()
         return True
     except Exception as exc:
-        print(f"[ping_neo4j] failed: {exc}")
+        logger.error(f"Neo4j ping failed: {exc}")
         return False
+
 
 
 # ════════════════════════════════════════════
