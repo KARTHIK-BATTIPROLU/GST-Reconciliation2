@@ -16,18 +16,26 @@ if not os.getenv("BACKEND_URL"):
     print("WARNING: BACKEND_URL not set, using default localhost.")
 
 TIMEOUT = 10  # seconds
+API_KEY = os.getenv("API_KEY")
+
+
+def _get_headers() -> dict:
+    headers = {}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    return headers
 
 
 def _get(path: str) -> dict:
     """Send a GET request to the backend and return JSON."""
-    resp = requests.get(f"{BACKEND_URL}{path}", timeout=TIMEOUT)
+    resp = requests.get(f"{BACKEND_URL}{path}", headers=_get_headers(), timeout=TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 
 def _post(path: str, payload: dict) -> dict:
     """Send a POST request to the backend and return JSON."""
-    resp = requests.post(f"{BACKEND_URL}{path}", json=payload, timeout=TIMEOUT)
+    resp = requests.post(f"{BACKEND_URL}{path}", json=payload, headers=_get_headers(), timeout=TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 

@@ -10,7 +10,7 @@ Endpoints:
 import asyncio
 from fastapi import APIRouter, HTTPException
 
-from backend.database import get_mongo_db, get_neo4j_driver
+from backend.database import get_mongo_db, get_neo4j_driver, is_neo4j_available
 
 router = APIRouter(prefix="/dashboard", tags=["CFO Dashboard"])
 
@@ -52,7 +52,7 @@ async def list_taxpayers():
     return {"taxpayers": records}
 
 
-from backend.schemas.validation import GSTINQuery
+from backend.schemas.validation import GSTINQuery, validate_gstin_param
 
 # ════════════════════════════════════════════
 # GET /dashboard/overview/{gstin}
@@ -283,10 +283,100 @@ async def vendor_network(gstin: str):
     Uses the exact Cypher pattern specified:
         MATCH (a:Taxpayer)-[:ISSUED]->(:Invoice)-[:BILLED_TO]->(b:Taxpayer)
         WHERE a.gstin = $gstin
-    """
 
+    Falls back to MongoDB-only connection derivation when Neo4j is unavailable.
+    """
+    try:
+        gstin = validate_gstin_param(gstin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not is_neo4j_available():
+        db = get_mongo_db()
+        invoices_as_buyer = await db.Invoices.find(
+            {"Buyer_GSTIN": gstin}, {"_id": 0}
+        ).to_list(length=500)
+        invoices_as_seller = await db.Invoices.find(
+            {"Seller_GSTIN": gstin}, {"_id": 0}
+        ).to_list(length=500)
+
+        # Build connections from invoice data
+        connections: list[dict] = []
+        # Group by seller GSTIN (for buyer role)
+        seller_map: dict = {}
+        for inv in invoices_as_buyer:
+            sg = inv.get("Seller_GSTIN", "")
+            if not sg:
+                continue
+            if sg not in seller_map:
+                seller_map[sg] = {"invoices": [], "total_value": 0.0}
+            seller_map[sg]["invoices"].append(inv.get("Invoice_ID", ""))
+            try:
+                seller_map[sg]["total_value"] += float(inv.get("Value", 0))
+            except (ValueError, TypeError):
+                pass
+
+        # Look up seller names
+        seller_gstins = list(seller_map.keys())
+        if seller_gstins:
+            sellers = await db.Taxpayers.find(
+                {"GSTIN": {"$in": seller_gstins}}, {"_id": 0, "_source_file": 0, "_source_row": 0}
+            ).to_list(length=500)
+            seller_info = {s["GSTIN"]: s for s in sellers}
+            for sg, data in seller_map.items():
+                info = seller_info.get(sg, {})
+                connections.append({
+                    "role": "BUYER",
+                    "partner_gstin": sg,
+                    "partner_name": info.get("Name", sg),
+                    "partner_risk": info.get("Risk_Category", "UNKNOWN"),
+                    "invoices": data["invoices"],
+                    "total_value": round(data["total_value"], 2),
+                })
+
+        # Group by buyer GSTIN (for seller role)
+        buyer_map: dict = {}
+        for inv in invoices_as_seller:
+            bg = inv.get("Buyer_GSTIN", "")
+            if not bg:
+                continue
+            if bg not in buyer_map:
+                buyer_map[bg] = {"invoices": [], "total_value": 0.0}
+            buyer_map[bg]["invoices"].append(inv.get("Invoice_ID", ""))
+            try:
+                buyer_map[bg]["total_value"] += float(inv.get("Value", 0))
+            except (ValueError, TypeError):
+                pass
+
+        buyer_gstins = list(buyer_map.keys())
+        if buyer_gstins:
+            buyers = await db.Taxpayers.find(
+                {"GSTIN": {"$in": buyer_gstins}}, {"_id": 0, "_source_file": 0, "_source_row": 0}
+            ).to_list(length=500)
+            buyer_info = {b["GSTIN"]: b for b in buyers}
+            for bg, data in buyer_map.items():
+                info = buyer_info.get(bg, {})
+                connections.append({
+                    "role": "SELLER",
+                    "partner_gstin": bg,
+                    "partner_name": info.get("Name", bg),
+                    "partner_risk": info.get("Risk_Category", "UNKNOWN"),
+                    "invoices": data["invoices"],
+                    "total_value": round(data["total_value"], 2),
+                })
+
+        return {
+            "gstin": gstin,
+            "connections": connections,
+            "graph_available": False,
+            "note": "Neo4j unavailable — connections derived from MongoDB invoice data.",
+        }
+
+    # Neo4j path
     def _query():
         driver = get_neo4j_driver()
+        if driver is None:
+            return []
         with driver.session() as session:
             result = session.run(
                 """
@@ -308,4 +398,4 @@ async def vendor_network(gstin: str):
             return [record.data() for record in result]
 
     records = await asyncio.to_thread(_query)
-    return {"gstin": gstin, "connections": records}
+    return {"gstin": gstin, "connections": records, "graph_available": True}

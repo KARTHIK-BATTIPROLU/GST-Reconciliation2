@@ -11,9 +11,9 @@ GET  /graph/risk-score/{gstin}  — 2-hop neighbourhood risk score
 import asyncio
 from fastapi import APIRouter, HTTPException
 
-from backend.database import get_mongo_db, get_neo4j_driver
+from backend.database import get_mongo_db, get_neo4j_driver, is_neo4j_available
 from backend.graph_sync import sync_graph
-
+from backend.schemas.validation import validate_gstin_param, validate_invoice_param
 from backend.utils.logger import get_logger
 
 router = APIRouter(prefix="/graph", tags=["Graph"])
@@ -30,12 +30,23 @@ def _neo4j_read(query: str, **params) -> list[dict]:
     """
     try:
         driver = get_neo4j_driver()
+        if driver is None:
+            return []
         with driver.session() as session:
             result = session.run(query, **params)
             return [record.data() for record in result]
     except Exception as e:
         logger.error(f"Neo4j query failed: {e}")
         return []
+
+
+def _neo4j_unavailable_response(feature: str) -> dict:
+    """Standard response when Neo4j is not available."""
+    return {
+        "status": "unavailable",
+        "message": f"Neo4j graph database is not connected. {feature} requires Neo4j.",
+        "neo4j_status": "DOWN",
+    }
 
 
 # ════════════════════════════════════════════
@@ -46,6 +57,12 @@ def _neo4j_read(query: str, **params) -> list[dict]:
 async def trigger_graph_sync():
     """Run the full MongoDB → Neo4j graph projection.
     Idempotent — safe to call multiple times."""
+    if not is_neo4j_available():
+        return {
+            "status": "skipped",
+            "message": "Neo4j is not available. Sync skipped.",
+            "steps": [],
+        }
     report = await sync_graph()
     return report
 
@@ -79,16 +96,17 @@ async def audit_invoice(inv_id: str):
     """Multi-hop audit trail for a single invoice.
 
     Combines:
-      • Neo4j  — graph relationships, filing chain, compliance signals
+      • Neo4j  — graph relationships, filing chain, compliance signals (if available)
       • MongoDB — raw documents from every source collection
     """
-    # ── Neo4j: graph traversal ──
-    graph_rows = await asyncio.to_thread(_neo4j_read, AUDIT_CYPHER, inv_id=inv_id)
-
-    # ── MongoDB: raw source documents ──
+    # Validate input
+    try:
+        inv_id = validate_invoice_param(inv_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     db = get_mongo_db()
-    raw_invoice  = await db.Invoices.find_one({"Invoice_ID": inv_id}, {"_id": 0})
-    gstr1_entry  = await db.GSTR1.find_one({"Invoice_ID": inv_id}, {"_id": 0})
+    raw_invoice = await db.Invoices.find_one({"Invoice_ID": inv_id}, {"_id": 0})
+    gstr1_entry = await db.GSTR1.find_one({"Invoice_ID": inv_id}, {"_id": 0})
     gstr2b_entry = await db.GSTR2B.find_one({"Invoice_ID": inv_id}, {"_id": 0})
     purchase_entry = await db.Purchase_Register.find_one({"Invoice_ID": inv_id}, {"_id": 0})
     ewaybill_entry = await db.EWayBill.find_one({"Invoice_ID": inv_id}, {"_id": 0})
@@ -102,19 +120,32 @@ async def audit_invoice(inv_id: str):
         ).limit(10)
         gstr3b_entry = await gstr3b_cursor.to_list(length=10)
 
+    # ── Neo4j: graph traversal (if available) ──
+    graph_rows = []
+    if is_neo4j_available():
+        graph_rows = await asyncio.to_thread(_neo4j_read, AUDIT_CYPHER, inv_id=inv_id)
+
     if not graph_rows and not raw_invoice:
         raise HTTPException(status_code=404, detail=f"Invoice {inv_id} not found.")
 
     graph = graph_rows[0] if graph_rows else {}
 
-    # ── Compliance analysis ──
-    gstr1_filed   = graph.get("gstr1_return") is not None
-    gstr3b_filed  = graph.get("gstr3b_return") is not None
-    gstr1_status  = (graph.get("gstr1_return") or {}).get("status", "MISSING")
-    gstr3b_payment = (graph.get("gstr3b_return") or {}).get("payment_confirmed", "N")
-    itc_eligible  = (gstr2b_entry or {}).get("ITC_Eligible", "UNKNOWN")
-    itc_claimed   = graph.get("itc_claimed", False)
-    ewb_present   = graph.get("ewaybill") is not None
+    # ── Compliance analysis — use MongoDB data when Neo4j is unavailable ──
+    gstr1_filed = graph.get("gstr1_return") is not None if graph else (gstr1_entry is not None)
+    gstr3b_filed = graph.get("gstr3b_return") is not None if graph else bool(gstr3b_entry)
+    gstr1_status = (graph.get("gstr1_return") or {}).get("status", None) or \
+                   (gstr1_entry or {}).get("Status", "MISSING")
+    gstr3b_payment = (graph.get("gstr3b_return") or {}).get("payment_confirmed", None)
+    if gstr3b_payment is None and gstr3b_entry:
+        # Take from first entry
+        first_g3b = gstr3b_entry[0] if isinstance(gstr3b_entry, list) and gstr3b_entry else {}
+        gstr3b_payment = first_g3b.get("Payment_Confirmed", "N")
+    if gstr3b_payment is None:
+        gstr3b_payment = "N"
+
+    itc_eligible = (gstr2b_entry or {}).get("ITC_Eligible", "UNKNOWN")
+    itc_claimed = graph.get("itc_claimed", False) if graph else bool(purchase_entry)
+    ewb_present = graph.get("ewaybill") is not None if graph else (ewaybill_entry is not None)
 
     flags: list[str] = []
     if not gstr1_filed:
@@ -133,6 +164,7 @@ async def audit_invoice(inv_id: str):
     return {
         "invoice_id": inv_id,
         "graph_data": graph,
+        "graph_available": is_neo4j_available(),
         "mongo_data": {
             "invoice": raw_invoice,
             "gstr1": gstr1_entry,
@@ -179,6 +211,8 @@ RETURN a.gstin   AS gstin_a, a.name AS name_a, a.risk_category AS risk_a,
 async def detect_circular_trading():
     """Detect 3-party circular trading loops: A → B → C → A.
     Returns involved GSTINs, names, risk categories, and invoice IDs."""
+    if not is_neo4j_available():
+        return {"circles_found": 0, "circles": [], **_neo4j_unavailable_response("Circular trading detection")}
     records = await asyncio.to_thread(_neo4j_read, CIRCLES_CYPHER)
     return {"circles_found": len(records), "circles": records}
 
@@ -208,6 +242,8 @@ RETURN shared_value, match_type, members, size(members) AS cluster_size
 async def find_shadow_networks():
     """Detect taxpayers sharing the same IP address or phone number.
     Returns clusters grouped by shared attribute."""
+    if not is_neo4j_available():
+        return {"networks_found": 0, "networks": [], **_neo4j_unavailable_response("Shadow network detection")}
     records = await asyncio.to_thread(_neo4j_read, SHADOW_CYPHER)
     return {"networks_found": len(records), "networks": records}
 
@@ -240,20 +276,45 @@ async def risk_score(gstin: str):
 
     Examines all taxpayers within 2 invoice-hops and calculates
     a risk score (0-100) based on proximity to high/medium-risk entities.
+
+    Falls back to MongoDB-only risk category when Neo4j is unavailable.
     """
+    try:
+        gstin = validate_gstin_param(gstin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not is_neo4j_available():
+        # MongoDB-only fallback: use taxpayer's own risk category
+        db = get_mongo_db()
+        taxpayer = await db.Taxpayers.find_one({"GSTIN": gstin}, {"_id": 0})
+        if not taxpayer:
+            raise HTTPException(status_code=404, detail=f"Taxpayer {gstin} not found.")
+        own_risk = taxpayer.get("Risk_Category", "UNKNOWN")
+        base = {"HIGH": 40, "MEDIUM": 20, "LOW": 5}.get(own_risk, 10)
+        return {
+            "gstin": gstin,
+            "name": taxpayer.get("Name", ""),
+            "own_risk": own_risk,
+            "risk_score": base,
+            "total_neighbors": 0,
+            "high_risk_neighbors": [],
+            "medium_risk_neighbors": [],
+            "graph_available": False,
+            "note": "Neo4j unavailable — neighbour analysis skipped.",
+        }
+
     records = await asyncio.to_thread(_neo4j_read, RISK_CYPHER, gstin=gstin)
     if not records:
-        raise HTTPException(status_code=404, detail=f"Taxpayer {gstin} not found.")
+        raise HTTPException(status_code=404, detail=f"Taxpayer {gstin} not found in graph.")
 
     rec = records[0]
-    own_risk      = rec.get("own_risk", "UNKNOWN")
-    high_count    = rec.get("high_risk_count", 0) or 0
-    medium_count  = rec.get("medium_risk_count", 0) or 0
+    own_risk = rec.get("own_risk", "UNKNOWN")
+    high_count = rec.get("high_risk_count", 0) or 0
+    medium_count = rec.get("medium_risk_count", 0) or 0
 
     # ── Score calculation ──
-    # Base: own risk category
     base = {"HIGH": 40, "MEDIUM": 20, "LOW": 5}.get(own_risk, 10)
-    # Neighbour influence (capped at 60)
     neighbour_score = min(high_count * 15 + medium_count * 5, 60)
     score = min(base + neighbour_score, 100)
 
@@ -265,4 +326,5 @@ async def risk_score(gstin: str):
         "total_neighbors": rec.get("total_neighbors", 0),
         "high_risk_neighbors": rec.get("high_risk_neighbors", []),
         "medium_risk_neighbors": rec.get("medium_risk_neighbors", []),
+        "graph_available": True,
     }
